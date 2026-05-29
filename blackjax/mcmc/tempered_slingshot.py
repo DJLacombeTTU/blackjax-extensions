@@ -19,7 +19,6 @@ class TemperedSlingshotInfo(NamedTuple):
 
 def init(initial_positions: Any, logdensity_fn: Callable, num_temperatures: int) -> TemperedSlingshotState:
     """Initialize the global thermal multi-chain grid state from an initial position PyTree."""
-    # Discover the batch dimension of input chains
     leaves = jax.tree_util.tree_leaves(initial_positions)
     chains = leaves[0].shape[0] if len(leaves) > 0 else 1
     
@@ -29,7 +28,6 @@ def init(initial_positions: Any, logdensity_fn: Callable, num_temperatures: int)
     def init_temp_level(beta):
         tempered_fn = lambda theta: beta * logdensity_fn(theta)
         states_level = jax.vmap(lambda p: blackjax.slingshot(tempered_fn, step_size=1.0, num_proposals=1000).init(p))(initial_positions)
-        # Infer dimensionality from flat leaf structures safely
         dim = sum(jnp.prod(jnp.array(l.shape[1:])) for l in leaves)
         da_states_level = jax.vmap(lambda ss: init_adaptation(ss, dim))(jnp.ones(chains) * 0.1)
         return states_level, da_states_level
@@ -51,7 +49,7 @@ def build_kernel(
     target_swap_accept: float = 0.30,
     is_warmup: bool = False
 ) -> Callable:
-    """Build a pure, compiled JAX Markov transition kernel."""
+    """Build a pure, compiled JAX Markov transition kernel featuring Mass Matrix Pooling."""
     
     def one_step(rng_key: jax.Array, state: TemperedSlingshotState) -> tuple[TemperedSlingshotState, TemperedSlingshotInfo]:
         slingshot_states = state.slingshot_states
@@ -59,13 +57,11 @@ def build_kernel(
         logit_r = state.logit_r
         betas = state.betas
         
-        # Unpack structural properties
         leaves = jax.tree_util.tree_leaves(slingshot_states.position)
         chains = leaves[0].shape[1]
         
         sample_key, swap_key = jax.random.split(rng_key)
         
-        # 1. Update the temperature ladder explicitly if running inside a warmup matrix
         if is_warmup:
             r = jax.nn.sigmoid(logit_r)
             betas_list = [1.0]
@@ -73,7 +69,6 @@ def build_kernel(
                 betas_list.append(betas_list[-1] * r[idx])
             betas = jnp.array(betas_list)
 
-        # 2. Vectorized Step Exploration across the 2D Thermal Grid
         def single_temp_step(beta, states_level, da_states_level, keys_level):
             tempered_fn = lambda theta: beta * logdensity_fn(theta)
             def single_chain_step(key, s, da):
@@ -97,6 +92,19 @@ def build_kernel(
         keys = jax.random.split(sample_key, num_temperatures * chains).reshape(num_temperatures, chains, 2)
         next_states, next_da_states = jax.vmap(single_temp_step)(betas, slingshot_states, da_states, keys)
         
+        # --- MASS MATRIX POOLING SUBROUTINE ---
+        if is_warmup:
+            # Extract the stabilized, structured Cholesky factor from the cold chain (Index 0)
+            cold_cholesky = next_da_states.cholesky[0]  # Shape: (chains, dim, dim)
+            cold_cholesky_expanded = jnp.expand_dims(cold_cholesky, 0)  # Shape: (1, chains, dim, dim)
+            
+            # Broadcast inverse temperatures across tensor dimensions
+            betas_expanded = betas[:, None, None, None]  # Shape: (num_temperatures, 1, 1, 1)
+            
+            # Execute beta-weighted shrinkage regularization across the full thermal grid
+            pooled_cholesky = betas_expanded * next_da_states.cholesky + (1.0 - betas_expanded) * cold_cholesky_expanded
+            next_da_states = next_da_states._replace(cholesky=pooled_cholesky)
+        
         # 3. Replica Exchange Swap Executions
         step_swaps = jnp.zeros(num_temperatures - 1)
         for i in range(num_temperatures - 1):
@@ -119,7 +127,6 @@ def build_kernel(
             next_states = jax.tree_util.tree_map(update_full_tree, next_states, state_i, state_j)
             
             if is_warmup:
-                # Target the desired acceptance metric inside ratio space
                 logit_r = logit_r.at[i].add(- (1.0 / jnp.power(100, 0.6)) * (mean_p_accept - target_swap_accept))
                 
         return TemperedSlingshotState(
